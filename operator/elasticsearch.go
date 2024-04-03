@@ -3,28 +3,25 @@ package operator
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
 	"net/url"
 	"sync"
 	"time"
 
-	"k8s.io/apimachinery/pkg/runtime"
-
 	log "github.com/sirupsen/logrus"
-	zv1 "github.com/zalando-incubator/es-operator/pkg/apis/zalando.org/v1"
-	"github.com/zalando-incubator/es-operator/pkg/clientset"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	pv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/kubernetes"
 	kube_record "k8s.io/client-go/tools/record"
+	metrics "k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
 const (
@@ -36,7 +33,8 @@ const (
 
 type ElasticsearchOperator struct {
 	logger                *log.Entry
-	kube                  *clientset.Clientset
+	kube                  *kubernetes.Clientset
+	metrics               *metrics.Clientset
 	interval              time.Duration
 	autoscalerInterval    time.Duration
 	metricsInterval       time.Duration
@@ -47,7 +45,8 @@ type ElasticsearchOperator struct {
 	elasticsearchEndpoint *url.URL
 	operating             map[types.UID]operatingEntry
 	sync.Mutex
-	recorder kube_record.EventRecorder
+	recorder    kube_record.EventRecorder
+	stsSelector string
 }
 
 type operatingEntry struct {
@@ -58,7 +57,8 @@ type operatingEntry struct {
 
 // NewElasticsearchOperator initializes a new ElasticsearchDataSet operator instance.
 func NewElasticsearchOperator(
-	client *clientset.Clientset,
+	kube *kubernetes.Clientset,
+	metrics *metrics.Clientset,
 	priorityNodeSelectors map[string]string,
 	interval,
 	autoscalerInterval time.Duration,
@@ -67,13 +67,17 @@ func NewElasticsearchOperator(
 	clusterDNSZone string,
 	elasticsearchEndpoint *url.URL,
 ) *ElasticsearchOperator {
+
+	stsSelector := flag.String("sts-selector", "es.operator/enabled", "Find participating ES StatefulSets")
+
 	return &ElasticsearchOperator{
 		logger: log.WithFields(
 			log.Fields{
 				"operator": "elasticsearch",
 			},
 		),
-		kube:                  client,
+		kube:                  kube,
+		metrics:               metrics,
 		interval:              interval,
 		autoscalerInterval:    autoscalerInterval,
 		metricsInterval:       60 * time.Second,
@@ -83,7 +87,8 @@ func NewElasticsearchOperator(
 		clusterDNSZone:        clusterDNSZone,
 		elasticsearchEndpoint: elasticsearchEndpoint,
 		operating:             make(map[types.UID]operatingEntry),
-		recorder:              createEventRecorder(client),
+		recorder:              createEventRecorder(kube),
+		stsSelector:           *stsSelector,
 	}
 }
 
@@ -92,82 +97,7 @@ func (o *ElasticsearchOperator) Run(ctx context.Context) {
 	go o.collectMetrics(ctx)
 	go o.runAutoscaler(ctx)
 
-	// run EDS watcher
-	o.runWatch(ctx)
-	<-ctx.Done()
 	o.logger.Info("Terminating main operator loop.")
-}
-
-// Run setups up a shared informer for listing and watching changes to pods and
-// starts listening for events.
-func (o *ElasticsearchOperator) runWatch(ctx context.Context) {
-	informer := cache.NewSharedIndexInformer(
-		cache.NewListWatchFromClient(
-			o.kube.ZalandoV1().RESTClient(),
-			"elasticsearchdatasets",
-			o.namespace, fields.Everything(),
-		),
-		&zv1.ElasticsearchDataSet{},
-		0, // skip resync
-		cache.Indexers{},
-	)
-
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    o.add,
-		UpdateFunc: o.update,
-		DeleteFunc: o.del,
-	})
-
-	go informer.Run(ctx.Done())
-
-	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
-		log.Errorf("Timed out waiting for caches to sync")
-		return
-	}
-
-	log.Info("Synced ElasticsearchDataSet watcher")
-}
-
-// add is the handler for an EDS getting added.
-func (o *ElasticsearchOperator) add(obj interface{}) {
-	eds, ok := obj.(*zv1.ElasticsearchDataSet)
-	if !ok {
-		log.Errorf("Failed to get EDS object")
-		return
-	}
-
-	err := o.operateEDS(eds, false)
-	if err != nil {
-		log.Errorf("Add failed, this is bad!: %v", err)
-	}
-}
-
-// update is the handler for an EDS getting updated.
-func (o *ElasticsearchOperator) update(oldObj, newObj interface{}) {
-	newEDS, ok := newObj.(*zv1.ElasticsearchDataSet)
-	if !ok {
-		log.Errorf("Failed to get EDS object")
-		return
-	}
-
-	err := o.operateEDS(newEDS, false)
-	if err != nil {
-		log.Errorf("Add failed, this is bad!: %v", err)
-	}
-}
-
-// del is the handler for an EDS getting deleted.
-func (o *ElasticsearchOperator) del(obj interface{}) {
-	eds, ok := obj.(*zv1.ElasticsearchDataSet)
-	if !ok {
-		log.Errorf("Failed to get EDS object")
-		return
-	}
-
-	err := o.operateEDS(eds, true)
-	if err != nil {
-		log.Errorf("Add failed, this is bad!: %v", err)
-	}
 }
 
 // collectMetrics collects metrics for all the managed EDS resources.
@@ -188,12 +118,12 @@ func (o *ElasticsearchOperator) collectMetrics(ctx context.Context) {
 				continue
 			}
 
-			for _, es := range resources {
-				if es.ElasticsearchDataSet.Spec.Scaling != nil && es.ElasticsearchDataSet.Spec.Scaling.Enabled {
+			for _, esr := range resources {
+				if esr.enabled {
 					metrics := &ElasticsearchMetricsCollector{
 						kube:   o.kube,
 						logger: log.WithFields(log.Fields{"collector": "metrics"}),
-						es:     *es,
+						esr:    *esr,
 					}
 					err := metrics.collectMetrics(ctx)
 					if err != nil {
@@ -230,16 +160,16 @@ func (o *ElasticsearchOperator) runAutoscaler(ctx context.Context) {
 				continue
 			}
 
-			for _, es := range resources {
-				if es.ElasticsearchDataSet.Spec.Scaling != nil && es.ElasticsearchDataSet.Spec.Scaling.Enabled {
-					endpoint := o.getElasticsearchEndpoint(es.ElasticsearchDataSet)
+			for _, esr := range resources {
+				if esr.enabled {
+					endpoint := o.getElasticsearchEndpoint(esr.sts)
 
-					client := &ESClient{
+					esr.esClient = &ESClient{
 						Endpoint:             endpoint,
-						excludeSystemIndices: es.ElasticsearchDataSet.Spec.ExcludeSystemIndices,
+						excludeSystemIndices: true,
 					}
 
-					err := o.scaleEDS(ctx, es.ElasticsearchDataSet, es, client)
+					err := o.scaleESR(ctx, esr)
 					if err != nil {
 						o.logger.Error(err)
 						continue
@@ -253,125 +183,28 @@ func (o *ElasticsearchOperator) runAutoscaler(ctx context.Context) {
 	}
 }
 
-type EDSResource struct {
-	eds      *zv1.ElasticsearchDataSet
-	kube     *clientset.Clientset
-	esClient *ESClient
-	recorder kube_record.EventRecorder
-}
-
-func (r *EDSResource) Name() string {
-	return r.eds.Name
-}
-
-func (r *EDSResource) Namespace() string {
-	return r.eds.Namespace
-}
-
-func (r *EDSResource) APIVersion() string {
-	return r.eds.APIVersion
-}
-
-func (r *EDSResource) Kind() string {
-	return r.eds.Kind
-}
-
-func (r *EDSResource) Labels() map[string]string {
-	return r.eds.Labels
-}
-
-func (r *EDSResource) LabelSelector() map[string]string {
-	return map[string]string{esDataSetLabelKey: r.Name()}
-}
-
-func (r *EDSResource) Generation() int64 {
-	return r.eds.Generation
-}
-
-func (r *EDSResource) UID() types.UID {
-	return r.eds.UID
-}
-
-func (r *EDSResource) Replicas() int32 {
-	return edsReplicas(r.eds)
-}
-
-func (r *EDSResource) PodTemplateSpec() *v1.PodTemplateSpec {
-	template := r.eds.Spec.Template.DeepCopy()
-	return &v1.PodTemplateSpec{
-		ObjectMeta: metav1.ObjectMeta{
-			Annotations: template.Annotations,
-			Labels:      template.Labels,
-		},
-		Spec: template.Spec,
-	}
-}
-
-func (r *EDSResource) VolumeClaimTemplates() []v1.PersistentVolumeClaim {
-	claims := make([]v1.PersistentVolumeClaim, 0, len(r.eds.Spec.VolumeClaimTemplates))
-	for _, template := range r.eds.Spec.VolumeClaimTemplates {
-		claims = append(claims, v1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:        template.Name,
-				Labels:      template.Labels,
-				Annotations: template.Annotations,
-			},
-			Spec: template.Spec,
-		})
-	}
-	return claims
-}
-
-func (r *EDSResource) EnsureResources(ctx context.Context) error {
-	// ensure PDB
-	err := r.ensurePodDisruptionBudget(ctx)
-	if err != nil {
-		return err
-	}
-
-	// ensure service
-	err = r.ensureService(ctx)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (r *EDSResource) Self() runtime.Object {
-	return r.eds
-}
-
 // ensurePodDisruptionBudget creates a PodDisruptionBudget for the
 // ElasticsearchDataSet if it doesn't already exist.
-func (r *EDSResource) ensurePodDisruptionBudget(ctx context.Context) error {
+func (o *ElasticsearchOperator) ensurePodDisruptionBudget(ctx context.Context, esr *ESResource) error {
 	var pdb *pv1.PodDisruptionBudget
 	var err error
 
-	pdb, err = r.kube.PolicyV1().PodDisruptionBudgets(r.eds.Namespace).Get(ctx, r.eds.Name, metav1.GetOptions{})
+	pdb, err = o.kube.PolicyV1().PodDisruptionBudgets(esr.sts.Namespace).Get(ctx, esr.sts.Name, metav1.GetOptions{})
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			return fmt.Errorf(
 				"failed to get PodDisruptionBudget for %s %s/%s: %v",
-				r.eds.Kind,
-				r.eds.Namespace, r.eds.Name,
+				esr.sts.Kind,
+				esr.sts.Namespace, esr.sts.Name,
 				err,
 			)
 		}
 		pdb = nil
 	}
 
-	// check if owner
-	if pdb != nil && !isOwnedReference(r, pdb.ObjectMeta) {
-		return fmt.Errorf(
-			"PodDisruptionBudget %s/%s is not owned by the %s %s/%s",
-			pdb.Namespace, pdb.Name,
-			r.eds.Kind,
-			r.eds.Namespace, r.eds.Name,
-		)
-	}
+	// Removed owner check that was here...
 
-	matchLabels := r.LabelSelector()
+	// Removed selector
 
 	createPDB := false
 
@@ -380,14 +213,14 @@ func (r *EDSResource) ensurePodDisruptionBudget(ctx context.Context) error {
 		maxUnavailable := intstr.FromInt(0)
 		pdb = &pv1.PodDisruptionBudget{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      r.eds.Name,
-				Namespace: r.eds.Namespace,
+				Name:      esr.sts.Name,
+				Namespace: esr.sts.Namespace,
 				OwnerReferences: []metav1.OwnerReference{
 					{
-						APIVersion: r.eds.APIVersion,
-						Kind:       r.eds.Kind,
-						Name:       r.eds.Name,
-						UID:        r.eds.UID,
+						APIVersion: esr.sts.APIVersion,
+						Kind:       esr.sts.Kind,
+						Name:       esr.sts.Name,
+						UID:        esr.sts.UID,
 					},
 				},
 			},
@@ -397,111 +230,20 @@ func (r *EDSResource) ensurePodDisruptionBudget(ctx context.Context) error {
 		}
 	}
 
-	pdb.Labels = r.eds.Labels
-	pdb.Spec.Selector = &metav1.LabelSelector{
-		MatchLabels: matchLabels,
-	}
-
 	if createPDB {
 		var err error
-		_, err = r.kube.PolicyV1().PodDisruptionBudgets(pdb.Namespace).Create(ctx, pdb, metav1.CreateOptions{})
+		_, err = o.kube.PolicyV1().PodDisruptionBudgets(pdb.Namespace).Create(ctx, pdb, metav1.CreateOptions{})
 		if err != nil {
 			return fmt.Errorf(
 				"failed to create PodDisruptionBudget for %s %s/%s: %v",
-				r.eds.Kind,
-				r.eds.Namespace, r.eds.Name,
+				esr.sts.Kind,
+				esr.sts.Namespace, esr.sts.Name,
 				err,
 			)
 		}
-		r.recorder.Event(r.eds, v1.EventTypeNormal, "CreatedPDB", fmt.Sprintf(
+		r.recorder.Event(esr.sts, v1.EventTypeNormal, "CreatedPDB", fmt.Sprintf(
 			"Created PodDisruptionBudget '%s/%s' for %s",
-			pdb.Namespace, pdb.Name, r.eds.Kind,
-		))
-	}
-
-	return nil
-}
-
-// ensureService creates a Service for the ElasticsearchDataSet if it doesn't
-// already exist.
-func (r *EDSResource) ensureService(ctx context.Context) error {
-	var svc *v1.Service
-	var err error
-
-	svc, err = r.kube.CoreV1().Services(r.eds.Namespace).Get(ctx, r.eds.Name, metav1.GetOptions{})
-	if err != nil {
-		if !errors.IsNotFound(err) {
-			return fmt.Errorf(
-				"failed to get Service for %s %s/%s: %v",
-				r.eds.Kind,
-				r.eds.Namespace, r.eds.Name,
-				err,
-			)
-		}
-		svc = nil
-	}
-
-	// check if owner
-	if svc != nil && !isOwnedReference(r, svc.ObjectMeta) {
-		return fmt.Errorf(
-			"the Service '%s/%s' is not owned by the %s '%s/%s'",
-			svc.Namespace, svc.Name,
-			r.eds.Kind,
-			r.eds.Namespace, r.eds.Name,
-		)
-	}
-
-	matchLabels := r.LabelSelector()
-
-	createService := false
-
-	if svc == nil {
-		createService = true
-		svc = &v1.Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      r.eds.Name,
-				Namespace: r.eds.Namespace,
-				OwnerReferences: []metav1.OwnerReference{
-					{
-						APIVersion: r.eds.APIVersion,
-						Kind:       r.eds.Kind,
-						Name:       r.eds.Name,
-						UID:        r.eds.UID,
-					},
-				},
-			},
-			Spec: v1.ServiceSpec{
-				Type: v1.ServiceTypeClusterIP,
-			},
-		}
-	}
-
-	svc.Labels = r.eds.Labels
-	svc.Spec.Selector = matchLabels
-	// TODO: derive port from EDS
-	svc.Spec.Ports = []v1.ServicePort{
-		{
-			Name:       "elasticsearch",
-			Protocol:   v1.ProtocolTCP,
-			Port:       defaultElasticsearchDataSetEndpointPort,
-			TargetPort: intstr.FromInt(defaultElasticsearchDataSetEndpointPort),
-		},
-	}
-
-	if createService {
-		var err error
-		_, err = r.kube.CoreV1().Services(svc.Namespace).Create(ctx, svc, metav1.CreateOptions{})
-		if err != nil {
-			return fmt.Errorf(
-				"failed to create Service for %s %s/%s: %v",
-				r.eds.Kind,
-				r.eds.Namespace, r.eds.Name,
-				err,
-			)
-		}
-		r.recorder.Event(r.eds, v1.EventTypeNormal, "CreatedService", fmt.Sprintf(
-			"Created Service '%s/%s' for %s",
-			svc.Namespace, svc.Name, r.eds.Kind,
+			pdb.Namespace, pdb.Name, esr.sts.Kind,
 		))
 	}
 
@@ -509,76 +251,68 @@ func (r *EDSResource) ensureService(ctx context.Context) error {
 }
 
 // Drain drains a pod for Elasticsearch data.
-func (r *EDSResource) Drain(ctx context.Context, pod *v1.Pod) error {
-	if r.eds.Spec.SkipDraining {
+func (esr *ESResource) Drain(ctx context.Context, pod *v1.Pod) error {
+	if esr.skipDraining {
 		return nil
 	}
-	return r.esClient.Drain(ctx, pod)
+	return esr.esClient.Drain(ctx, pod)
 }
 
 // PreScaleDownHook ensures that the IndexReplicas is set as defined in the EDS
 // 'scaling-operation' annotation prior to scaling down the internal
 // StatefulSet.
-func (r *EDSResource) PreScaleDownHook(ctx context.Context) error {
-	return r.applyScalingOperation(ctx)
+func (esr *ESResource) PreScaleDownHook(ctx context.Context) error {
+	return esr.applyScalingOperation(ctx)
 }
 
 // OnStableReplicasHook ensures that the indexReplicas is set as defined in the
 // EDS scaling-operation annotation.
-func (r *EDSResource) OnStableReplicasHook(ctx context.Context) error {
-	err := r.applyScalingOperation(ctx)
+func (esr *ESResource) OnStableReplicasHook(ctx context.Context) error {
+	err := esr.applyScalingOperation(ctx)
 	if err != nil {
 		return err
 	}
 
 	// cleanup state in ES
-	return r.esClient.Cleanup(ctx)
+	return esr.esClient.Cleanup(ctx)
 }
 
 // UpdateStatus updates the status of the EDS to set the current replicas from
 // StatefulSet and updating the observedGeneration.
-func (r *EDSResource) UpdateStatus(ctx context.Context, sts *appsv1.StatefulSet) error {
-	observedGeneration := int64(0)
-	if r.eds.Status.ObservedGeneration != nil {
-		observedGeneration = *r.eds.Status.ObservedGeneration
-	}
+func (o *ElasticsearchOperator) UpdateStatus(ctx context.Context, esr *ESResource) error {
+	observedGeneration := esr.sts.Status.ObservedGeneration
 
 	replicas := int32(0)
-	if sts.Spec.Replicas != nil {
-		replicas = *sts.Spec.Replicas
+	if esr.sts.Spec.Replicas != nil {
+		replicas = *esr.sts.Spec.Replicas
 	}
 
-	if r.eds.Generation != observedGeneration ||
-		r.eds.Status.Replicas != replicas {
-		r.eds.Status.Replicas = replicas
-		r.eds.Status.ObservedGeneration = &r.eds.Generation
-		eds, err := r.kube.ZalandoV1().ElasticsearchDataSets(r.eds.Namespace).UpdateStatus(ctx, r.eds, metav1.UpdateOptions{})
+	if esr.sts.Generation != observedGeneration ||
+		esr.sts.Status.Replicas != replicas {
+		esr.sts.Status.Replicas = replicas
+		esr.sts.Status.ObservedGeneration = esr.sts.Generation
+		sts, err := o.kube.AppsV1().StatefulSets(esr.sts.Namespace).UpdateStatus(ctx, esr.sts, metav1.UpdateOptions{})
+		o.logger.Logf(log.DebugLevel, "sts status updated %s.%s", sts.Namespace, sts.Name)
 		if err != nil {
 			return err
 		}
-
-		// set TypeMeta manually because of this bug:
-		// https://github.com/kubernetes/client-go/issues/308
-		eds.APIVersion = "zalando.org/v1"
-		eds.Kind = "ElasticsearchDataSet"
-		r.eds = eds
 	}
 
 	return nil
 }
 
-func (r *EDSResource) applyScalingOperation(ctx context.Context) error {
-	operation, err := edsScalingOperation(r.eds)
+func (esr *ESResource) applyScalingOperation(ctx context.Context) error {
+	operation, err := esrScalingOperation(esr)
 	if err != nil {
 		return err
 	}
 
 	if operation != nil && operation.ScalingDirection != NONE {
-		err = r.esClient.UpdateIndexSettings(operation.IndexReplicas)
+		err = esr.esClient.UpdateIndexSettings(operation.IndexReplicas)
 		if err != nil {
 			return err
 		}
-		err = r.removeScalingOperationAnnotation(ctx)
+		err = esr.removeScalingOperationAnnotation(ctx)
 		if err != nil {
 			return err
 		}
@@ -589,52 +323,26 @@ func (r *EDSResource) applyScalingOperation(ctx context.Context) error {
 // removeScalingOperationAnnotation removes the 'scaling-operation' annotation
 // from the EDS.
 // If the annotation is already gone, this is a no-op.
-func (r *EDSResource) removeScalingOperationAnnotation(ctx context.Context) error {
-	if _, ok := r.eds.Annotations[esScalingOperationKey]; ok {
-		delete(r.eds.Annotations, esScalingOperationKey)
-		_, err := r.kube.ZalandoV1().
-			ElasticsearchDataSets(r.eds.Namespace).
-			Update(ctx, r.eds, metav1.UpdateOptions{})
+func (esr *ESResource) removeScalingOperationAnnotation(ctx context.Context) error {
+	if _, ok := esr.sts.Annotations[esScalingOperationKey]; ok {
+		delete(esr.sts.Annotations, esScalingOperationKey)
+		_, err := esr.kube.AppsV1().StatefulSets(esr.sts.Namespace).
+			Update(ctx, esr.sts, metav1.UpdateOptions{})
 		if err != nil {
-			return fmt.Errorf("failed to remove 'scaling-operating' annotation from EDS: %v", err)
+			return fmt.Errorf("failed to remove 'scaling-operating' annotation from ES STS: %v", err)
 		}
 	}
 	return nil
 }
 
-// calls kubernetes APIs to refresh itself
-func (r *EDSResource) Get(ctx context.Context) (StatefulResource, error) {
-	newEds, err := r.kube.ZalandoV1().ElasticsearchDataSets(r.eds.Namespace).Get(ctx, r.eds.Name, metav1.GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	// set TypeMeta manually because of this bug:
-	// https://github.com/kubernetes/client-go/issues/308
-	newEds.Kind = r.Kind()
-	newEds.APIVersion = r.APIVersion()
-	sr := &EDSResource{
-		eds:      newEds,
-		kube:     r.kube,
-		esClient: r.esClient, // TODO: think about not setting this twice
-		recorder: r.recorder,
-	}
-
-	return sr, nil
-}
-
-func (o *ElasticsearchOperator) operateEDS(eds *zv1.ElasticsearchDataSet, deleted bool) error {
-	// set TypeMeta manually because of this bug:
-	// https://github.com/kubernetes/client-go/issues/308
-	eds.APIVersion = "zalando.org/v1"
-	eds.Kind = "ElasticsearchDataSet"
+func (o *ElasticsearchOperator) operateES(esr *ESResource, deleted bool) error {
 
 	// insert into operating
 	o.Lock()
 	defer o.Unlock()
 
 	// restart if already being operated on.
-	if entry, ok := o.operating[eds.UID]; ok {
+	if entry, ok := o.operating[esr.sts.UID]; ok {
 		entry.cancel()
 		// wait for previous operation to terminate
 		entry.logger.Infof("Waiting for operation to stop")
@@ -645,30 +353,18 @@ func (o *ElasticsearchOperator) operateEDS(eds *zv1.ElasticsearchDataSet, delete
 		return nil
 	}
 
-	if !o.hasOwnership(eds) {
-		o.logger.Infof("Skipping EDS %s/%s, not owned by the operator", eds.Namespace, eds.Name)
-		return nil
-	}
-
 	doneCh := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 
 	logger := log.WithFields(log.Fields{
-		"eds":       eds.Name,
-		"namespace": eds.Namespace,
+		"es":        esr.sts.Name,
+		"namespace": esr.sts.Namespace,
 	})
 	// add to operating table
-	o.operating[eds.UID] = operatingEntry{
+	o.operating[esr.sts.UID] = operatingEntry{
 		cancel: cancel,
 		doneCh: doneCh,
 		logger: logger,
-	}
-
-	endpoint := o.getElasticsearchEndpoint(eds)
-
-	// TODO: abstract this
-	client := &ESClient{
-		Endpoint: endpoint,
 	}
 
 	operator := &Operator{
@@ -679,33 +375,12 @@ func (o *ElasticsearchOperator) operateEDS(eds *zv1.ElasticsearchDataSet, delete
 		recorder:              o.recorder,
 	}
 
-	rs := &EDSResource{
-		eds:      eds,
-		kube:     o.kube,
-		esClient: client, // TODO: think about not setting this twice
-		recorder: o.recorder,
-	}
-
-	go operator.Run(ctx, doneCh, rs)
+	go operator.Run(ctx, doneCh, esr)
 
 	return nil
 }
 
-// hasOwnership returns true if the operator is the "owner" of the EDS.
-// Whether it's owner is determined by the value of the
-// 'es-operator.zalando.org/operator' annotation. If the value
-// matches the operatorID then it owns it, or if the operatorID is
-// "" and there's no annotation set.
-func (o *ElasticsearchOperator) hasOwnership(eds *zv1.ElasticsearchDataSet) bool {
-	if eds.Annotations != nil {
-		if owner, ok := eds.Annotations[esOperatorAnnotationKey]; ok {
-			return owner == o.operatorID
-		}
-	}
-	return o.operatorID == ""
-}
-
-func (o *ElasticsearchOperator) getElasticsearchEndpoint(eds *zv1.ElasticsearchDataSet) *url.URL {
+func (o *ElasticsearchOperator) getElasticsearchEndpoint(eds *appsv1.StatefulSet) *url.URL {
 	if o.elasticsearchEndpoint != nil {
 		return o.elasticsearchEndpoint
 	}
@@ -723,36 +398,15 @@ func (o *ElasticsearchOperator) getElasticsearchEndpoint(eds *zv1.ElasticsearchD
 	}
 }
 
-type ESResource struct {
-	ElasticsearchDataSet *zv1.ElasticsearchDataSet
-	StatefulSet          *appsv1.StatefulSet
-	MetricSet            *zv1.ElasticsearchMetricSet
-	Pods                 []v1.Pod
-}
-
-// Replicas returns the desired node replicas of an ElasticsearchDataSet
+// getReplicas returns the desired node replicas.
 // In case it was not specified, it will return '1'.
-func (es *ESResource) Replicas() int32 {
-	return edsReplicas(es.ElasticsearchDataSet)
-}
+func getReplicas(esr *ESResource) int {
+	replicas := esr.replicas
 
-// edsReplicas returns the desired node replicas of an ElasticsearchDataSet
-// In case it was not specified, it will return '1'.
-func edsReplicas(eds *zv1.ElasticsearchDataSet) int32 {
-	scaling := eds.Spec.Scaling
-	if scaling == nil || !scaling.Enabled {
-		if eds.Spec.Replicas == nil {
-			return 1
-		}
-		return *eds.Spec.Replicas
+	if esr.enabled {
+		replicas = int(math.Max(float64(replicas), float64(esr.minReplicas)))
 	}
-	// initialize with minReplicas
-	minReplicas := eds.Spec.Scaling.MinReplicas
-	if eds.Spec.Replicas == nil {
-		return minReplicas
-	}
-	currentReplicas := *eds.Spec.Replicas
-	return int32(math.Max(float64(currentReplicas), float64(scaling.MinReplicas)))
+	return replicas
 }
 
 // collectResources collects all the ElasticsearchDataSet resources and there
@@ -760,57 +414,52 @@ func edsReplicas(eds *zv1.ElasticsearchDataSet) int32 {
 func (o *ElasticsearchOperator) collectResources(ctx context.Context) (map[types.UID]*ESResource, error) {
 	resources := make(map[types.UID]*ESResource)
 
-	edss, err := o.kube.ZalandoV1().ElasticsearchDataSets(o.namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
+	// Find all participating ES StatefulSets by label
+	statefulSets, err := o.kube.AppsV1().StatefulSets(o.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: o.stsSelector,
+	})
 
-	// create a map of ElasticsearchDataSet clusters to later map the matching
-	// StatefulSet.
-	for _, eds := range edss.Items {
-		eds := eds
-		if !o.hasOwnership(&eds) {
-			continue
+	for _, sts := range statefulSets.Items {
+		endpoint := o.getElasticsearchEndpoint(&sts)
+
+		// TODO: abstract this
+		client := &ESClient{
+			Endpoint: endpoint,
 		}
 
-		// set TypeMeta manually because of this bug:
-		// https://github.com/kubernetes/client-go/issues/308
-		eds.APIVersion = "zalando.org/v1"
-		eds.Kind = "ElasticsearchDataSet"
-
-		resources[eds.UID] = &ESResource{
-			ElasticsearchDataSet: &eds,
+		esr := &ESResource{
+			kube:     o.kube,
+			esClient: client,
+			sts:      &sts,
+			logger: log.WithFields(
+				log.Fields{
+					"es-resource": sts.Namespace + "." + sts.Name,
+				},
+			),
 		}
-	}
 
-	metricSets, err := o.kube.ZalandoV1().ElasticsearchMetricSets(o.namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
+		resources[sts.UID] = esr
 
-	// Map metricSets to the owning ElasticsearchDataSet resource.
-	for _, ms := range metricSets.Items {
-		ms := ms
-		if uid, ok := getOwnerUID(ms.ObjectMeta); ok {
-			if er, ok := resources[uid]; ok {
-				er.MetricSet = &ms
-			}
+		metricSets, err := o.metrics.MetricsV1beta1().PodMetricses(sts.Namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, err
 		}
-	}
 
-	// TODO: label filter
-	pods, err := o.kube.CoreV1().Pods(o.namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
+		pods, err := o.kube.CoreV1().Pods(o.namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
 
-	for _, pod := range pods.Items {
-		for _, es := range resources {
-			es := es
-			// TODO: leaky abstraction
-			if v, ok := pod.Labels[esDataSetLabelKey]; ok && v == es.ElasticsearchDataSet.Name {
-				es.Pods = append(es.Pods, pod)
-				break
+		cpuUsage := getCPUUsagePercent(metricSets.Items, pods.Items)
+		o.logger.Debugf("The cpu utlization accross all pods is %f", cpuUsage)
+
+		// Let's revisit this, not sure what is happening here, why it is needed
+		for _, pod := range pods.Items {
+			for _, esr := range resources {
+				if v, ok := pod.Labels[esDataSetLabelKey]; ok && v == esr.sts.Name {
+					esr.pods = append(esr.pods, pod)
+					break
+				}
 			}
 		}
 	}
@@ -818,17 +467,17 @@ func (o *ElasticsearchOperator) collectResources(ctx context.Context) (map[types
 	return resources, nil
 }
 
-func (o *ElasticsearchOperator) scaleEDS(ctx context.Context, eds *zv1.ElasticsearchDataSet, es *ESResource, client *ESClient) error {
-	err := validateScalingSettings(eds.Spec.Scaling)
+func (o *ElasticsearchOperator) scaleESR(ctx context.Context, esr *ESResource) error {
+	err := validateScalingSettings(esr)
 	if err != nil {
-		o.recorder.Event(eds, v1.EventTypeWarning, "ScalingInvalid", fmt.Sprintf(
+		o.recorder.Event(esr.sts, v1.EventTypeWarning, "ScalingInvalid", fmt.Sprintf(
 			"Scaling settings are invalid: %v", err),
 		)
 		return err
 	}
 
 	// first, try to find an existing annotation and return it
-	scalingOperation, err := edsScalingOperation(eds)
+	scalingOperation, err := esrScalingOperation(esr)
 	if err != nil {
 		return err
 	}
@@ -838,16 +487,10 @@ func (o *ElasticsearchOperator) scaleEDS(ctx context.Context, eds *zv1.Elasticse
 		return nil
 	}
 
-	// second, calculate a new EDS scaling operation
-	scaling := eds.Spec.Scaling
-	name := eds.Name
-	namespace := eds.Namespace
+	currentReplicas := getReplicas(esr)
+	as := NewAutoScaler(esr, o.metricsInterval)
 
-	currentReplicas := edsReplicas(eds)
-	eds.Spec.Replicas = &currentReplicas
-	as := NewAutoScaler(es, o.metricsInterval, client)
-
-	if scaling != nil && scaling.Enabled {
+	if esr.enabled {
 		scalingOperation, err := as.GetScalingOperation()
 		if err != nil {
 			return err
@@ -857,18 +500,18 @@ func (o *ElasticsearchOperator) scaleEDS(ctx context.Context, eds *zv1.Elasticse
 		if scalingOperation.NodeReplicas != nil && *scalingOperation.NodeReplicas != currentReplicas {
 			now := metav1.Now()
 			if *scalingOperation.NodeReplicas > currentReplicas {
-				eds.Status.LastScaleUpStarted = &now
+				esr.lastScaleUpStarted = &now
 			} else {
-				eds.Status.LastScaleDownStarted = &now
+				esr.lastScaleDownStarted = &now
 			}
-			log.Infof("Updating last scaling event in EDS '%s/%s'", namespace, name)
+			log.Infof("Updating last scaling event in EDS '%s/%s'", esr.sts.Namespace, esr.sts.Name)
 
 			// update status
-			eds, err = o.kube.ZalandoV1().ElasticsearchDataSets(eds.Namespace).UpdateStatus(ctx, eds, metav1.UpdateOptions{})
+			sts, err := o.kube.AppsV1().StatefulSets(esr.sts.Namespace).UpdateStatus(ctx, esr.sts, metav1.UpdateOptions{})
 			if err != nil {
 				return err
 			}
-			eds.Spec.Replicas = scalingOperation.NodeReplicas
+			log.Infof("%s.%s Updated", sts.Namespace, sts.Name)
 		}
 
 		// TODO: move to a function
@@ -878,11 +521,10 @@ func (o *ElasticsearchOperator) scaleEDS(ctx context.Context, eds *zv1.Elasticse
 		}
 
 		if scalingOperation.ScalingDirection != NONE {
-			eds.Annotations[esScalingOperationKey] = string(jsonBytes)
+			esr.sts.Annotations[esScalingOperationKey] = string(jsonBytes)
 
-			// persist changes of EDS
-			log.Infof("Updating desired scaling for EDS '%s/%s'. New desired replicas: %d. %s", namespace, name, *eds.Spec.Replicas, scalingOperation.Description)
-			_, err = o.kube.ZalandoV1().ElasticsearchDataSets(eds.Namespace).Update(ctx, eds, metav1.UpdateOptions{})
+			log.Infof("Updating desired scaling for ESR '%s/%s'. New desired replicas: %d. %s", esr.sts.Namespace, esr.sts.Name, esr.replicas, scalingOperation.Description)
+			_, err = o.kube.AppsV1().StatefulSets(esr.sts.Namespace).Update(ctx, esr.sts, metav1.UpdateOptions{})
 			if err != nil {
 				return err
 			}
@@ -917,8 +559,8 @@ func templateInjectLabels(template v1.PodTemplateSpec, labels map[string]string)
 // edsScalingOperation returns the scaling operation read from the
 // scaling-operation annotation on the EDS. If no operation is defined it will
 // return nil.
-func edsScalingOperation(eds *zv1.ElasticsearchDataSet) (*ScalingOperation, error) {
-	if op, ok := eds.Annotations[esScalingOperationKey]; ok {
+func esrScalingOperation(esr *ESResource) (*ScalingOperation, error) {
+	if op, ok := esr.sts.Annotations[esScalingOperationKey]; ok {
 		scalingOperation := &ScalingOperation{}
 		err := json.Unmarshal([]byte(op), scalingOperation)
 		if err != nil {
@@ -935,53 +577,52 @@ func edsScalingOperation(eds *zv1.ElasticsearchDataSet) (*ScalingOperation, erro
 //   - min can not be less than 0.
 //   - 'replicas', 'indexReplicas' and 'shardsPerNode' settings should not
 //     conflict.
-func validateScalingSettings(scaling *zv1.ElasticsearchDataSetScaling) error {
+func validateScalingSettings(esr *ESResource) error {
+	esr.logger.Log(log.DebugLevel, "validate scaling")
 	// don't validate if scaling is not enabled
-	if scaling == nil || !scaling.Enabled {
-		return nil
-	}
+	if esr.enabled {
 
-	// check that min is not greater than max values
-	if scaling.MinReplicas > scaling.MaxReplicas {
-		return fmt.Errorf(
-			"minReplicas(%d) can't be greater than maxReplicas(%d)",
-			scaling.MinReplicas,
-			scaling.MaxReplicas,
-		)
-	}
+		// check that min is not greater than max values
+		if esr.minReplicas > esr.maxReplicas {
+			return fmt.Errorf(
+				"minReplicas(%d) can't be greater than maxReplicas(%d)",
+				esr.minReplicas,
+				esr.maxReplicas,
+			)
+		}
 
-	if scaling.MinIndexReplicas > scaling.MaxIndexReplicas {
-		return fmt.Errorf(
-			"minIndexReplicas(%d) can't be greater than maxIndexReplicas(%d)",
-			scaling.MinIndexReplicas,
-			scaling.MaxIndexReplicas,
-		)
-	}
+		if esr.minIndexReplicas > esr.maxIndexReplicas {
+			return fmt.Errorf(
+				"minIndexReplicas(%d) can't be greater than maxIndexReplicas(%d)",
+				esr.minIndexReplicas,
+				esr.maxIndexReplicas,
+			)
+		}
 
-	if scaling.MinShardsPerNode > scaling.MaxShardsPerNode {
-		return fmt.Errorf(
-			"minShardsPerNode(%d) can't be greater than maxShardsPerNode(%d)",
-			scaling.MinShardsPerNode,
-			scaling.MaxShardsPerNode,
-		)
-	}
+		if esr.minShardsPerNode > esr.maxShardsPerNode {
+			return fmt.Errorf(
+				"minShardsPerNode(%d) can't be greater than maxShardsPerNode(%d)",
+				esr.minShardsPerNode,
+				esr.maxShardsPerNode,
+			)
+		}
 
-	// ensure that relation between replicas and indexReplicas is valid
-	if scaling.MinReplicas < (scaling.MinIndexReplicas + 1) {
-		return fmt.Errorf(
-			"minReplicas(%d) can not be less than minIndexReplicas(%d)+1",
-			scaling.MinReplicas,
-			scaling.MinIndexReplicas,
-		)
-	}
+		// ensure that relation between replicas and indexReplicas is valid
+		if esr.minReplicas < (esr.minIndexReplicas + 1) {
+			return fmt.Errorf(
+				"minReplicas(%d) can not be less than minIndexReplicas(%d)+1",
+				esr.minReplicas,
+				esr.minIndexReplicas,
+			)
+		}
 
-	if scaling.MaxReplicas < (scaling.MaxIndexReplicas + 1) {
-		return fmt.Errorf(
-			"maxReplicas(%d) can not be less than maxIndexReplicas(%d)+1",
-			scaling.MaxReplicas,
-			scaling.MaxIndexReplicas,
-		)
+		if esr.maxReplicas < (esr.maxIndexReplicas + 1) {
+			return fmt.Errorf(
+				"maxReplicas(%d) can not be less than maxIndexReplicas(%d)+1",
+				esr.maxReplicas,
+				esr.maxIndexReplicas,
+			)
+		}
 	}
-
 	return nil
 }

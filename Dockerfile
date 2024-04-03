@@ -1,7 +1,5 @@
-FROM registry.opensource.zalan.do/library/alpine-3:latest
-LABEL maintainer="Team Lens @ Zalando SE <team-lens@zalando.de>"
+FROM alpine:latest
 
-# add binary
 ADD build/linux/es-operator /
 
 ENTRYPOINT ["/es-operator"]

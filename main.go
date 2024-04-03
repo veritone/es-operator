@@ -14,10 +14,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 	"github.com/zalando-incubator/es-operator/operator"
-	"github.com/zalando-incubator/es-operator/pkg/clientset"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
+	metrics "k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
 const (
@@ -46,8 +47,12 @@ var (
 )
 
 func main() {
+	log.Info("Starting the es-operator, Veritone forked.")
+
 	config.PodSelectors = Labels(map[string]string{})
 	config.PriorityNodeSelectors = Labels(map[string]string{})
+
+	log.Infof("Configuration %v", config)
 
 	kingpin.Flag("debug", "Enable debug logging.").BoolVar(&config.Debug)
 	kingpin.Flag("interval", "Interval between syncing.").
@@ -84,13 +89,16 @@ func main() {
 		log.Fatalf("Failed to setup Kubernetes config: %v", err)
 	}
 
-	client, err := clientset.NewClientset(kubeConfig)
+	kube, err := kubernetes.NewForConfig(kubeConfig)
 	if err != nil {
 		log.Fatalf("Failed to setup Kubernetes client: %v", err)
 	}
 
+	metrics, err := metrics.NewForConfig(kubeConfig)
+
 	operator := operator.NewElasticsearchOperator(
-		client,
+		kube,
+		metrics,
 		config.PriorityNodeSelectors,
 		config.Interval,
 		config.AutoscalerInterval,
@@ -175,6 +183,7 @@ func configureKubeConfig(apiServerURL *url.URL, timeout time.Duration, stopCh <-
 	config.Burst = 500
 	// disable TLSClientConfig to make the custom Transport work
 	config.TLSClientConfig = rest.TLSClientConfig{}
+
 	return config, nil
 }
 
