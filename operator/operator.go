@@ -268,11 +268,6 @@ func (o *Operator) rescaleStatefulSet(ctx context.Context, esr *ESResource) erro
 		if replicaDiff > 0 {
 			replicas += replicaDiff
 		} else {
-			err := esr
-			if err != nil {
-				return err
-			}
-
 			// TODO: optimize by scaling down all pending pods
 			replicas--
 		}
@@ -297,30 +292,32 @@ func (o *Operator) rescaleStatefulSet(ctx context.Context, esr *ESResource) erro
 			for _, pod := range pods.Items[replicas:] {
 				newSTS, err := esr.kube.AppsV1().StatefulSets(esr.sts.Namespace).Get(ctx, esr.sts.Name, metav1.GetOptions{})
 
-				newDesiredReplicas := newSTS.Spec.Replicas
-				if *newDesiredReplicas > int32(desiredReplicas) {
-					log.Infof("EDS %s/%s target scaling definition changed from %d to %d, aborting scale-down", newSTS.Namespace, newSTS.Name, desiredReplicas, newDesiredReplicas)
-					return nil
-				}
-
-				// if pod is Pending we don't need to safely drain it.
-				if pod.Status.Phase == v1.PodPending {
-					continue
-				}
-
-				// wait for StatefulSet to be stable before continuing
-				// always ensure a stable StatefulSet before draining
-				err = waitForStableStatefulSet(ctx, o.kube, esr.sts, stabilizationTimeout)
 				if err != nil {
-					return fmt.Errorf("StatefulSet %s/%s is not stable: %v", esr.sts.Namespace, esr.sts.Name, err)
-				}
+					newDesiredReplicas := newSTS.Spec.Replicas
+					if *newDesiredReplicas > int32(desiredReplicas) {
+						log.Infof("EDS %s/%s target scaling definition changed from %d to %d, aborting scale-down", newSTS.Namespace, newSTS.Name, desiredReplicas, newDesiredReplicas)
+						return nil
+					}
 
-				log.Infof("Draining Pod %s/%s for scaledown", pod.Namespace, pod.Name)
-				err = esr.Drain(ctx, &pod)
-				if err != nil {
-					return fmt.Errorf("failed to drain pod %s/%s: %v", pod.Namespace, pod.Name, err)
+					// if pod is Pending we don't need to safely drain it.
+					if pod.Status.Phase == v1.PodPending {
+						continue
+					}
+
+					// wait for StatefulSet to be stable before continuing
+					// always ensure a stable StatefulSet before draining
+					err = waitForStableStatefulSet(ctx, o.kube, esr.sts, stabilizationTimeout)
+					if err != nil {
+						return fmt.Errorf("StatefulSet %s/%s is not stable: %v", esr.sts.Namespace, esr.sts.Name, err)
+					}
+
+					log.Infof("Draining Pod %s/%s for scaledown", pod.Namespace, pod.Name)
+					err = esr.Drain(ctx, &pod)
+					if err != nil {
+						return fmt.Errorf("failed to drain pod %s/%s: %v", pod.Namespace, pod.Name, err)
+					}
+					log.Infof("Pod %s/%s drained", pod.Namespace, pod.Name)
 				}
-				log.Infof("Pod %s/%s drained", pod.Namespace, pod.Name)
 			}
 		}
 
@@ -329,8 +326,8 @@ func (o *Operator) rescaleStatefulSet(ctx context.Context, esr *ESResource) erro
 		esr.sts.Spec.Replicas = &replicasInt32
 
 		if replicas != currentReplicas {
-			o.recorder.Event(sr.Self(), v1.EventTypeNormal, "ChangingReplicas",
-				fmt.Sprintf("Changing replicas %d -> %d for StatefulSet '%s/%s'", currentReplicas, replicas, sts.Namespace,
+			o.recorder.Event(esr.sts, v1.EventTypeNormal, "ChangingReplicas",
+				fmt.Sprintf("Changing replicas %d -> %d for StatefulSet '%s/%s'", currentReplicas, replicas, esr.sts.Namespace,
 					esr.sts.Name))
 		}
 

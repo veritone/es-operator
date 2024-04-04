@@ -13,13 +13,12 @@ import (
 	log "github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
-	pv1 "k8s.io/api/policy/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 	kube_record "k8s.io/client-go/tools/record"
 	metrics "k8s.io/metrics/pkg/client/clientset/versioned"
 )
@@ -94,10 +93,93 @@ func NewElasticsearchOperator(
 
 // Run runs the main loop of the operator.
 func (o *ElasticsearchOperator) Run(ctx context.Context) {
+
+	o.logger.Info("Run Loop...")
+
+	o.logger.Info("Run Loop, collect metrics...")
 	go o.collectMetrics(ctx)
+	o.logger.Info("Run Loop, run auto scalar")
 	go o.runAutoscaler(ctx)
 
+	o.runWatch(ctx)
+	<-ctx.Done()
+
 	o.logger.Info("Terminating main operator loop.")
+}
+
+// Run setups up a shared informer for listing and watching changes to pods and
+// starts listening for events.
+func (o *ElasticsearchOperator) runWatch(ctx context.Context) {
+	informer := cache.NewSharedIndexInformer(
+		cache.NewListWatchFromClient(
+			o.kube.AppsV1().RESTClient(),
+			"es-operator",
+			o.namespace, fields.Everything(),
+		),
+		&appsv1.StatefulSet{},
+		0, // skip resync
+		cache.Indexers{},
+	)
+
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			o.add(ctx, obj)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			o.update(ctx, oldObj, newObj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			o.del(ctx, obj)
+		},
+	})
+
+	go informer.Run(ctx.Done())
+
+	if !cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
+		log.Errorf("Timed out waiting for caches to sync")
+		return
+	}
+
+	log.Info("Synced es-operator watcher")
+}
+
+func (o *ElasticsearchOperator) resolveAndOperateSTS(ctx context.Context, source string, obj interface{}) {
+	sts, ok := obj.(*appsv1.StatefulSet)
+	if !ok {
+		log.Errorf("%s handler failed to get StatefulSet object", source)
+		return
+	}
+
+	log.Infof("%s handler will search for STS %s.%s and check for qualification", source, sts.Namespace, sts.Name)
+
+	resources, err := o.collectResources(ctx)
+	if err != nil {
+		for _, esr := range resources {
+			log.Infof("%s handler is qualifying STS %s.%s against known STS es resource %s.%s [%t]", source, sts.Namespace, sts.Name, esr.sts.Namespace, esr.sts.Name, esr.enabled)
+			if esr.enabled {
+				if esr.sts.UID == sts.UID {
+					err := o.operateES(esr, false)
+					if err != nil {
+						log.Errorf("Add %s is unable to operate %s.%s: %v", source, esr.sts.Namespace, esr.sts.Name, err)
+					}
+				}
+			}
+		}
+	} else {
+		log.Errorf("Add %s is unable to collect STS resources: %v", source, err)
+	}
+}
+
+func (o *ElasticsearchOperator) add(ctx context.Context, obj interface{}) {
+	o.resolveAndOperateSTS(ctx, "Add", obj)
+}
+
+func (o *ElasticsearchOperator) update(ctx context.Context, oldObj, newObj interface{}) {
+	o.resolveAndOperateSTS(ctx, "Update", newObj)
+}
+
+func (o *ElasticsearchOperator) del(ctx context.Context, obj interface{}) {
+	o.resolveAndOperateSTS(ctx, "Delete", obj)
 }
 
 // collectMetrics collects metrics for all the managed EDS resources.
@@ -181,73 +263,6 @@ func (o *ElasticsearchOperator) runAutoscaler(ctx context.Context) {
 			return
 		}
 	}
-}
-
-// ensurePodDisruptionBudget creates a PodDisruptionBudget for the
-// ElasticsearchDataSet if it doesn't already exist.
-func (o *ElasticsearchOperator) ensurePodDisruptionBudget(ctx context.Context, esr *ESResource) error {
-	var pdb *pv1.PodDisruptionBudget
-	var err error
-
-	pdb, err = o.kube.PolicyV1().PodDisruptionBudgets(esr.sts.Namespace).Get(ctx, esr.sts.Name, metav1.GetOptions{})
-	if err != nil {
-		if !errors.IsNotFound(err) {
-			return fmt.Errorf(
-				"failed to get PodDisruptionBudget for %s %s/%s: %v",
-				esr.sts.Kind,
-				esr.sts.Namespace, esr.sts.Name,
-				err,
-			)
-		}
-		pdb = nil
-	}
-
-	// Removed owner check that was here...
-
-	// Removed selector
-
-	createPDB := false
-
-	if pdb == nil {
-		createPDB = true
-		maxUnavailable := intstr.FromInt(0)
-		pdb = &pv1.PodDisruptionBudget{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      esr.sts.Name,
-				Namespace: esr.sts.Namespace,
-				OwnerReferences: []metav1.OwnerReference{
-					{
-						APIVersion: esr.sts.APIVersion,
-						Kind:       esr.sts.Kind,
-						Name:       esr.sts.Name,
-						UID:        esr.sts.UID,
-					},
-				},
-			},
-			Spec: pv1.PodDisruptionBudgetSpec{
-				MaxUnavailable: &maxUnavailable,
-			},
-		}
-	}
-
-	if createPDB {
-		var err error
-		_, err = o.kube.PolicyV1().PodDisruptionBudgets(pdb.Namespace).Create(ctx, pdb, metav1.CreateOptions{})
-		if err != nil {
-			return fmt.Errorf(
-				"failed to create PodDisruptionBudget for %s %s/%s: %v",
-				esr.sts.Kind,
-				esr.sts.Namespace, esr.sts.Name,
-				err,
-			)
-		}
-		r.recorder.Event(esr.sts, v1.EventTypeNormal, "CreatedPDB", fmt.Sprintf(
-			"Created PodDisruptionBudget '%s/%s' for %s",
-			pdb.Namespace, pdb.Name, esr.sts.Kind,
-		))
-	}
-
-	return nil
 }
 
 // Drain drains a pod for Elasticsearch data.
@@ -357,7 +372,7 @@ func (o *ElasticsearchOperator) operateES(esr *ESResource, deleted bool) error {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	logger := log.WithFields(log.Fields{
-		"es":        esr.sts.Name,
+		"name":      esr.sts.Name,
 		"namespace": esr.sts.Namespace,
 	})
 	// add to operating table
@@ -412,6 +427,9 @@ func getReplicas(esr *ESResource) int {
 // collectResources collects all the ElasticsearchDataSet resources and there
 // corresponding StatefulSets if they exist.
 func (o *ElasticsearchOperator) collectResources(ctx context.Context) (map[types.UID]*ESResource, error) {
+
+	o.logger.Info("Collect Resources")
+
 	resources := make(map[types.UID]*ESResource)
 
 	// Find all participating ES StatefulSets by label
@@ -419,46 +437,60 @@ func (o *ElasticsearchOperator) collectResources(ctx context.Context) (map[types
 		LabelSelector: o.stsSelector,
 	})
 
-	for _, sts := range statefulSets.Items {
-		endpoint := o.getElasticsearchEndpoint(&sts)
+	o.logger.Infof("Retrieved a list of statefulsets based on selector %s, size %d", o.stsSelector, statefulSets.Size())
 
-		// TODO: abstract this
-		client := &ESClient{
-			Endpoint: endpoint,
-		}
+	if err == nil {
+		for _, sts := range statefulSets.Items {
 
-		esr := &ESResource{
-			kube:     o.kube,
-			esClient: client,
-			sts:      &sts,
-			logger: log.WithFields(
-				log.Fields{
-					"es-resource": sts.Namespace + "." + sts.Name,
-				},
-			),
-		}
+			o.logger.Infof("Add %s.%s to list of resources", sts.Namespace, sts.Name)
 
-		resources[sts.UID] = esr
+			endpoint := o.getElasticsearchEndpoint(&sts)
 
-		metricSets, err := o.metrics.MetricsV1beta1().PodMetricses(sts.Namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
-		}
+			o.logger.Infof("ES endpoint for %s.%s is %s", sts.Namespace, sts.Name, endpoint)
 
-		pods, err := o.kube.CoreV1().Pods(o.namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
-		}
+			// TODO: abstract this
+			client := &ESClient{
+				Endpoint: endpoint,
+			}
 
-		cpuUsage := getCPUUsagePercent(metricSets.Items, pods.Items)
-		o.logger.Debugf("The cpu utlization accross all pods is %f", cpuUsage)
+			esr := &ESResource{
+				kube:     o.kube,
+				esClient: client,
+				sts:      &sts,
+				logger: log.WithFields(
+					log.Fields{
+						"es-resource": sts.Namespace + "." + sts.Name,
+					},
+				),
+			}
 
-		// Let's revisit this, not sure what is happening here, why it is needed
-		for _, pod := range pods.Items {
-			for _, esr := range resources {
-				if v, ok := pod.Labels[esDataSetLabelKey]; ok && v == esr.sts.Name {
-					esr.pods = append(esr.pods, pod)
-					break
+			resources[sts.UID] = esr
+
+			selector := sts.Spec.Selector.MatchLabels
+
+			labelSelector := ""
+			for key, value := range selector {
+				labelSelector += fmt.Sprintf("%s=%s,", key, value)
+			}
+			labelSelector = labelSelector[:len(labelSelector)-1]
+
+			pods, err := o.kube.CoreV1().Pods(sts.Namespace).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+			if err != nil {
+				o.logger.Errorf("Error gethering pods for %s.%s: %v", sts.Namespace, sts.Name, err)
+			}
+
+			for _, pod := range pods.Items {
+				o.logger.Infof("Pod %s in sts %s.%s", pod.Name, sts.Namespace, sts.Name)
+
+				podMetrics, err := o.metrics.MetricsV1beta1().PodMetricses(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+				if err != nil {
+					o.logger.Errorf("Error gethering metrics for pod %s for %s.%s: %v", pod.Name, sts.Namespace, sts.Name, err)
+				}
+
+				for _, container := range podMetrics.Containers {
+					cpuUsageNanoCores := container.Usage.Cpu().MilliValue()
+					cpuUsageMilliCores := cpuUsageNanoCores / 1000000
+					o.logger.Infof("Container %s in sts %s.%s has cpu amount of %d", container.Name, sts.Namespace, sts.Name, cpuUsageMilliCores)
 				}
 			}
 		}
