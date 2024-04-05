@@ -96,8 +96,6 @@ func (o *ElasticsearchOperator) Run(ctx context.Context) {
 
 	o.logger.Info("Run Loop...")
 
-	o.logger.Info("Run Loop, collect metrics...")
-	go o.collectMetrics(ctx)
 	o.logger.Info("Run Loop, run auto scalar")
 	go o.runAutoscaler(ctx)
 
@@ -182,45 +180,6 @@ func (o *ElasticsearchOperator) del(ctx context.Context, obj interface{}) {
 	o.resolveAndOperateSTS(ctx, "Delete", obj)
 }
 
-// collectMetrics collects metrics for all the managed EDS resources.
-// The metrics are stored in the coresponding ElasticsearchMetricSet and used
-// by the autoscaler for scaling EDS.
-func (o *ElasticsearchOperator) collectMetrics(ctx context.Context) {
-	nextCheck := time.Now().Add(-o.metricsInterval)
-
-	for {
-		o.logger.Debug("Collecting metrics")
-		select {
-		case <-time.After(time.Until(nextCheck)):
-			nextCheck = time.Now().Add(o.metricsInterval)
-
-			resources, err := o.collectResources(ctx)
-			if err != nil {
-				o.logger.Error(err)
-				continue
-			}
-
-			for _, esr := range resources {
-				if esr.enabled {
-					metrics := &ElasticsearchMetricsCollector{
-						kube:   o.kube,
-						logger: log.WithFields(log.Fields{"collector": "metrics"}),
-						esr:    *esr,
-					}
-					err := metrics.collectMetrics(ctx)
-					if err != nil {
-						o.logger.Error(err)
-						continue
-					}
-				}
-			}
-		case <-ctx.Done():
-			o.logger.Info("Terminating metrics collector loop.")
-			return
-		}
-	}
-}
-
 // runAutoscaler runs the EDS autoscaler which checks at an interval if any
 // EDS resources needs to be autoscaled. If autoscaling is needed this will be
 // indicated on the EDS with the
@@ -231,33 +190,37 @@ func (o *ElasticsearchOperator) runAutoscaler(ctx context.Context) {
 	nextCheck := time.Now().Add(-o.autoscalerInterval)
 
 	for {
-		o.logger.Debug("Checking autoscaling")
+		o.logger.Infof("Checking autoscaling at interval %d", o.autoscalerInterval)
+
 		select {
 		case <-time.After(time.Until(nextCheck)):
+
+			o.logger.Info("Autoscaling interval met")
+
 			nextCheck = time.Now().Add(o.autoscalerInterval)
 
+			o.logger.Info("Collect resources now...")
 			resources, err := o.collectResources(ctx)
 			if err != nil {
-				o.logger.Error(err)
+				o.logger.Errorf("Error collecting resources %v", err)
 				continue
 			}
 
+			o.logger.Info("Try scaling...")
 			for _, esr := range resources {
+				o.logger.Infof("Is this esr %s.%s enabled? %t", esr.sts.Namespace, esr.sts.Name, esr.enabled)
 				if esr.enabled {
-					endpoint := o.getElasticsearchEndpoint(esr.sts)
-
-					esr.esClient = &ESClient{
-						Endpoint:             endpoint,
-						excludeSystemIndices: true,
-					}
-
+					o.logger.Infof("Scale ESR now... %s.%s", esr.sts.Namespace, esr.sts.Name)
 					err := o.scaleESR(ctx, esr)
 					if err != nil {
-						o.logger.Error(err)
+						o.logger.Errorf("Error while in scaleESR: %v", err)
 						continue
 					}
 				}
 			}
+
+			o.logger.Info("Done for now...\n\n\n")
+
 		case <-ctx.Done():
 			o.logger.Info("Terminating autoscaler loop.")
 			return
@@ -436,10 +399,9 @@ func (o *ElasticsearchOperator) collectResources(ctx context.Context) (map[types
 	statefulSets, err := o.kube.AppsV1().StatefulSets(o.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: o.stsSelector,
 	})
-
-	o.logger.Infof("Retrieved a list of statefulsets based on selector %s, size %d", o.stsSelector, statefulSets.Size())
-
 	if err == nil {
+		o.logger.Infof("Retrieved a list of statefulsets based on selector %s, size %d", o.stsSelector, statefulSets.Size())
+
 		for _, sts := range statefulSets.Items {
 
 			o.logger.Infof("Add %s.%s to list of resources", sts.Namespace, sts.Name)
@@ -463,6 +425,7 @@ func (o *ElasticsearchOperator) collectResources(ctx context.Context) (map[types
 					},
 				),
 			}
+			esr.getScalingConfiguration(&sts)
 
 			resources[sts.UID] = esr
 
@@ -490,10 +453,12 @@ func (o *ElasticsearchOperator) collectResources(ctx context.Context) (map[types
 				for _, container := range podMetrics.Containers {
 					cpuUsageNanoCores := container.Usage.Cpu().MilliValue()
 					cpuUsageMilliCores := cpuUsageNanoCores / 1000000
-					o.logger.Infof("Container %s in sts %s.%s has cpu amount of %d", container.Name, sts.Namespace, sts.Name, cpuUsageMilliCores)
+					o.logger.Infof("Container %s in sts %s.%s has cpu amount of %dnc %dmc", container.Name, sts.Namespace, sts.Name, cpuUsageNanoCores, cpuUsageMilliCores)
 				}
 			}
 		}
+	} else {
+		o.logger.Errorf("Error retreiving the list of elastic search clusters: %v", err)
 	}
 
 	return resources, nil
@@ -508,9 +473,12 @@ func (o *ElasticsearchOperator) scaleESR(ctx context.Context, esr *ESResource) e
 		return err
 	}
 
+	log.Infof("scaleESR => esrScalingOperation %s.%s", esr.sts.Namespace, esr.sts.Name)
+
 	// first, try to find an existing annotation and return it
 	scalingOperation, err := esrScalingOperation(esr)
 	if err != nil {
+		log.Errorf("esrScalingOperation %s.%s failed: %v", esr.sts.Namespace, esr.sts.Name, err)
 		return err
 	}
 
@@ -592,6 +560,7 @@ func templateInjectLabels(template v1.PodTemplateSpec, labels map[string]string)
 // scaling-operation annotation on the EDS. If no operation is defined it will
 // return nil.
 func esrScalingOperation(esr *ESResource) (*ScalingOperation, error) {
+	log.Infof("esrScalingOperation => get annotations %s.%s: %s:%v", esr.sts.Namespace, esr.sts.Name, esScalingOperationKey, esr.sts.Annotations[esScalingOperationKey])
 	if op, ok := esr.sts.Annotations[esScalingOperationKey]; ok {
 		scalingOperation := &ScalingOperation{}
 		err := json.Unmarshal([]byte(op), scalingOperation)

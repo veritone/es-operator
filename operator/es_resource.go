@@ -59,43 +59,49 @@ type ESResource struct {
 	replicas             int
 }
 
-func getLabelValue(key string, sts *appsv1.StatefulSet, defaultValue interface{}) interface{} {
+func (esr *ESResource) getLabelValue(key string, sts *appsv1.StatefulSet, defaultValue interface{}) interface{} {
 	var val interface{} = defaultValue
 
 	if str, exists := sts.ObjectMeta.Labels[key]; exists {
 		switch defaultValue.(type) {
 		case int:
 			intVal, err := strconv.Atoi(str)
-			if err != nil {
+			esr.logger.Infof("getLabelValue %s = %d", key, intVal)
+			if err == nil {
 				val = intVal
 			}
 		case bool:
 			boolVal, err := strconv.ParseBool(str)
-			if err != nil {
+			esr.logger.Infof("getLabelValue %s = %t", key, boolVal)
+			if err == nil {
 				val = boolVal
 			}
 		}
 	}
 
+	esr.logger.Infof("getLabelValue %s = %v", key, val)
 	return val
 }
 
-func (esr ESResource) getScalingConfiguration(sts *appsv1.StatefulSet) {
-	esr.enabled = getLabelValue("es.operator/enabbled", sts, false).(bool)
-	esr.skipDraining = getLabelValue("es.operator/skipDraining", sts, false).(bool)
-	esr.minReplicas = getLabelValue("es.operator/minReplicas", sts, 1).(int)
-	esr.maxReplicas = getLabelValue("es.operator/maxReplicas", sts, 8).(int)
-	esr.minShards = getLabelValue("es.operator/minShards", sts, 1).(int)
-	esr.maxShards = getLabelValue("es.operator/maxShards", sts, 3).(int)
-	esr.minIndexReplicas = getLabelValue("es.operator/minIndexReplicas", sts, 1).(int)
-	esr.maxIndexReplicas = getLabelValue("es.operator/maxIndexReplicas", sts, 2).(int)
-	esr.minShardsPerNode = getLabelValue("es.operator/minShardsPerNode", sts, 2).(int)
-	esr.maxShardsPerNode = getLabelValue("es.operator/maxShardsPerNode", sts, 4).(int)
-	esr.scaleUpCPUBoundary = getLabelValue("es.operator/scaleUpCPUBoundary", sts, 50).(int)
-	esr.scaleDownCPUBoundary = getLabelValue("es.operator/scaleDownCPUBoundary", sts, 20).(int)
-	esr.scaleDownThresholdDurationSeconds = getLabelValue("es.operator/scaleDownThresholdDurationSeconds", sts, 120).(int)
-	esr.scaleUpCooldownSeconds = getLabelValue("es.operator/scaleUpCooldownSeconds", sts, 120).(int)
-	esr.scaleDownCooldownSeconds = getLabelValue("es.operator/scaleDownCooldownSeconds", sts, 120).(int)
-	esr.scaleUpThresholdDurationSeconds = getLabelValue("es.operator/scaleUpThresholdDurationSeconds", sts, 120).(int)
-	esr.diskUsagePercentScaledownWatermark = getLabelValue("es.operator/diskUsagePercentScaledownWatermark", sts, 120).(int)
+func (esr *ESResource) getScalingConfiguration(sts *appsv1.StatefulSet) {
+
+	esr.enabled = esr.getLabelValue("es.operator/enabled", sts, false).(bool)
+	esr.logger.Infof("The label for es.operator/enabled is %t", esr.enabled)
+
+	esr.skipDraining = esr.getLabelValue("es.operator/skipDraining", sts, false).(bool)
+	esr.minReplicas = esr.getLabelValue("es.operator/minReplicas", sts, 1).(int)
+	esr.maxReplicas = esr.getLabelValue("es.operator/maxReplicas", sts, 8).(int)
+	esr.minShards = esr.getLabelValue("es.operator/minShards", sts, 1).(int)
+	esr.maxShards = esr.getLabelValue("es.operator/maxShards", sts, 3).(int)
+	esr.minIndexReplicas = esr.getLabelValue("es.operator/minIndexReplicas", sts, 1).(int)
+	esr.maxIndexReplicas = esr.getLabelValue("es.operator/maxIndexReplicas", sts, 2).(int)
+	esr.minShardsPerNode = esr.getLabelValue("es.operator/minShardsPerNode", sts, 2).(int)
+	esr.maxShardsPerNode = esr.getLabelValue("es.operator/maxShardsPerNode", sts, 4).(int)
+	esr.scaleUpCPUBoundary = esr.getLabelValue("es.operator/scaleUpCPUBoundary", sts, 50).(int)
+	esr.scaleDownCPUBoundary = esr.getLabelValue("es.operator/scaleDownCPUBoundary", sts, 20).(int)
+	esr.scaleDownThresholdDurationSeconds = esr.getLabelValue("es.operator/scaleDownThresholdDurationSeconds", sts, 120).(int)
+	esr.scaleUpCooldownSeconds = esr.getLabelValue("es.operator/scaleUpCooldownSeconds", sts, 120).(int)
+	esr.scaleDownCooldownSeconds = esr.getLabelValue("es.operator/scaleDownCooldownSeconds", sts, 120).(int)
+	esr.scaleUpThresholdDurationSeconds = esr.getLabelValue("es.operator/scaleUpThresholdDurationSeconds", sts, 120).(int)
+	esr.diskUsagePercentScaledownWatermark = esr.getLabelValue("es.operator/diskUsagePercentScaledownWatermark", sts, 120).(int)
 }
